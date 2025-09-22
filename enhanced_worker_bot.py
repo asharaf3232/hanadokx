@@ -1,14 +1,15 @@
 # -*- coding: utf-8 -*-
 # =======================================================================================
-# --- 🦾 OKX Enhanced Worker Bot | v2.2 (Final Fix Edition) 🦾 ---
+# --- 🦾 OKX Enhanced Worker Bot | v2.3 (UI & Debugging Edition) 🦾 ---
 # =======================================================================================
 #
 # هذا البوت هو "اليد" المطورة في نظام "العقل والأيدي".
 #
-# --- v2.2 Changelog ---
-#   ✅ [إصلاح] إصلاح خطأ 'total' الذي كان يحدث عند عرض المحفظة.
-#   ✅ [إصلاح] إصلاح خطأ التعامل مع استثناءات Redis (AttributeError).
-#   ✅ [إصلاح] إصلاح نهائي لخطأ 'worker_id' في نظام التسجيل (Logging).
+# --- v2.3 Changelog ---
+#   ✅ [تحسين] إضافة أزرار تحكم ثابتة (ReplyKeyboardMarkup) لسهولة الاستخدام.
+#   ✅ [ميزة] إضافة وضع التصحيح (Debug Mode) لتسجيل مفصل للأحداث.
+#   ✅ [ميزة] إضافة أمر `/debug` لتفعيل/إلغاء تفعيل وضع التصحيح بشكل مؤقت.
+#   ✅ [إصلاح] تحسين منطق جلب وعرض إجمالي رصيد المحفظة.
 #
 # =======================================================================================
 
@@ -23,10 +24,16 @@ import ccxt.async_support as ccxt
 import redis.asyncio as redis
 import websockets.exceptions
 from dotenv import load_dotenv
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
 from telegram.constants import ParseMode
-from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler
+from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler, MessageHandler, filters
 from telegram.error import BadRequest, Conflict
+
+# --- تحميل متغيرات البيئة ---
+load_dotenv()
+
+# --- إعدادات وضع التصحيح ---
+WORKER_DEBUG_MODE = os.getenv('WORKER_DEBUG_MODE', 'false').lower() == 'true'
 
 # --- إعدادات التسجيل (Logging) ---
 class SafeFormatter(logging.Formatter):
@@ -38,7 +45,10 @@ class SafeFormatter(logging.Formatter):
 log_formatter = SafeFormatter('%(asctime)s - %(levelname)s - [%(worker_id)s] - [TradeID:%(trade_id)s] - %(message)s')
 log_handler = logging.StreamHandler()
 log_handler.setFormatter(log_formatter)
-root_logger = logging.getLogger(); root_logger.handlers = [log_handler]; root_logger.setLevel(logging.INFO)
+root_logger = logging.getLogger()
+root_logger.handlers = [log_handler]
+# تحديد مستوى التسجيل بناءً على وضع التصحيح
+root_logger.setLevel(logging.DEBUG if WORKER_DEBUG_MODE else logging.INFO)
 
 class ContextAdapter(logging.LoggerAdapter):
     def process(self, msg, kwargs):
@@ -46,9 +56,6 @@ class ContextAdapter(logging.LoggerAdapter):
         kwargs['extra'].setdefault('worker_id', self.extra.get('worker_id', 'N/A'))
         kwargs['extra'].setdefault('trade_id', 'N/A')
         return msg, kwargs
-
-# --- تحميل متغيرات البيئة ---
-load_dotenv()
 
 # --- إعدادات البوت العامل ---
 WORKER_ID = os.getenv('WORKER_ID', 'worker_01')
@@ -66,6 +73,15 @@ DB_FILE = f'okx_worker_{WORKER_ID}.db'
 EGYPT_TZ = ZoneInfo("Africa/Cairo")
 
 logger = ContextAdapter(logging.getLogger(__name__), {'worker_id': WORKER_ID})
+logger.info(f"Logging level set to: {logging.getLevelName(root_logger.level)}")
+
+# --- نصوص الأزرار الثابتة ---
+BTN_TEXT_DASHBOARD = "🖥️ عرض لوحة التحكم"
+BTN_TEXT_PORTFOLIO = "💼 المحفظة"
+BTN_TEXT_ACTIVE = "📈 الصفقات النشطة"
+BTN_TEXT_HISTORY = "📜 سجل الصفقات"
+BTN_TEXT_STATUS = "📡 حالة الاتصال"
+
 
 # --- الحالة العامة للبوت ---
 class BotState:
@@ -98,7 +114,7 @@ async def safe_edit_message(query, text, **kwargs):
     except Exception as e:
         logger.error(f"Edit Message Error: {e}")
 
-# --- إدارة قاعدة البيانات ---
+# --- إدارة قاعدة البيانات (بدون تغيير) ---
 async def init_database():
     try:
         async with aiosqlite.connect(DB_FILE) as conn:
@@ -143,7 +159,7 @@ async def log_pending_trade_to_db(signal, buy_order):
     except Exception as e:
         logger.error(f"DB Log Pending Error: {e}"); return False
 
-# --- منطق تنفيذ وإدارة الصفقات ---
+# --- منطق تنفيذ وإدارة الصفقات (بدون تغيير) ---
 async def activate_trade(order_id, symbol):
     log_ctx = {'trade_id': 'N/A'}
     try:
@@ -284,7 +300,7 @@ class PublicWebSocketManager:
             except Exception as e: logger.error(f"Public WS failed: {e}. Retrying..."); await asyncio.sleep(5)
 
 
-# --- منطق استقبال الإشارات وتنفيذها ---
+# --- منطق استقبال الإشارات وتنفيذها (بدون تغيير) ---
 async def execute_trade_from_signal(signal):
     symbol = signal.get('symbol')
     entry_price = signal.get('entry_price')
@@ -306,7 +322,7 @@ async def execute_trade_from_signal(signal):
     except Exception as e:
         logger.error(f"Trade execution failed for {symbol}: {e}", exc_info=True)
 
-# --- مستمع Redis ---
+# --- مستمع Redis (بدون تغيير) ---
 async def redis_listener():
     if not REDIS_URL:
         logger.critical("REDIS_URL is not set in the environment variables. The worker cannot start.")
@@ -327,7 +343,7 @@ async def redis_listener():
                 if message['type'] == 'message':
                     bot_data.last_signal_received_at = datetime.now(EGYPT_TZ)
                     signal_data = json.loads(message['data'])
-                    logger.info(f"Received new signal: {signal_data}")
+                    logger.debug(f"Received new signal raw data: {signal_data}")
                     asyncio.create_task(execute_trade_from_signal(signal_data))
 
         except redis.ConnectionError as e:
@@ -341,9 +357,21 @@ async def redis_listener():
 
 # --- واجهة تليجرام ---
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(f"👋 أهلاً بك في بوت العامل **{WORKER_ID}**.\nاضغط /dashboard لعرض لوحة التحكم.")
+    """Handler for /start command. Shows persistent keyboard."""
+    keyboard = [
+        [KeyboardButton(BTN_TEXT_DASHBOARD)],
+        [KeyboardButton(BTN_TEXT_PORTFOLIO), KeyboardButton(BTN_TEXT_ACTIVE)],
+        [KeyboardButton(BTN_TEXT_HISTORY), KeyboardButton(BTN_TEXT_STATUS)],
+    ]
+    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+    await update.message.reply_text(
+        f"👋 أهلاً بك في بوت العامل **{WORKER_ID}**.\nاستخدم الأزرار بالأسفل للتحكم.",
+        reply_markup=reply_markup,
+        parse_mode=ParseMode.MARKDOWN
+    )
 
 async def show_dashboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Shows the main inline keyboard dashboard."""
     status_emoji = "✅" if bot_data.redis_connected else "❌"
     
     keyboard = [
@@ -352,16 +380,18 @@ async def show_dashboard_command(update: Update, context: ContextTypes.DEFAULT_T
         [InlineKeyboardButton("الصفقات النشطة 📈", callback_data="active_trades")],
         [InlineKeyboardButton("سجل الصفقات 📜", callback_data="history")]
     ]
-    message_text = f"🖥️ **لوحة تحكم العامل: {WORKER_ID}**"
+    message_text = f"🖥️ **لوحة تحكم العامل: {WORKER_ID}**\n\nاختر أحد الخيارات لعرض التفاصيل."
     
-    target_message = update.message or update.callback_query.message
+    # Check if it's from a text command or a callback button
     if update.callback_query:
         await safe_edit_message(update.callback_query, message_text, reply_markup=InlineKeyboardMarkup(keyboard))
     else:
-        await target_message.reply_text(message_text, reply_markup=InlineKeyboardMarkup(keyboard))
+        await update.message.reply_text(message_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
 
 async def show_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    message = update.message
+    
     status_text = "متصل ✅" if bot_data.redis_connected else "غير متصل ❌"
     last_signal_time = bot_data.last_signal_received_at.strftime('%Y-%m-%d %H:%M:%S') if bot_data.last_signal_received_at else "لم يتم استلام أي إشارة بعد"
     
@@ -371,36 +401,57 @@ async def show_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE
             f"**آخر إشارة تم استلامها:** {last_signal_time}")
             
     keyboard = [[InlineKeyboardButton("🔄 تحديث", callback_data="status")], [InlineKeyboardButton("🔙 عودة", callback_data="dashboard")]]
-    await safe_edit_message(query, text, reply_markup=InlineKeyboardMarkup(keyboard))
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    if query:
+        await safe_edit_message(query, text, reply_markup=reply_markup)
+    else:
+        await message.reply_text(text, reply_markup=reply_markup, parse_mode=ParseMode.MARKDOWN)
 
 async def show_portfolio_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer("جاري جلب بيانات المحفظة...")
+    message = update.message
+    
+    if query:
+        await query.answer("جاري جلب بيانات المحفظة...")
+    else:
+        await message.reply_text("جاري جلب بيانات المحفظة...")
+
     try:
         balance = await bot_data.exchange.fetch_balance()
-        total_usdt_equity = balance.get('USDT', {}).get('total', 0)
-        text = f"**💼 محفظة الحساب ({WORKER_ID})**\n\n**إجمالي الرصيد:** `${total_usdt_equity:,.2f}` USDT\n\n**الأصول الأخرى:**\n"
+        logger.debug(f"Full balance response: {balance}")
         
-        # --- [إصلاح v2.2] تعديل طريقة قراءة الأرصدة ---
+        # [إصلاح v2.3] الاعتماد على totalEq للحصول على الإجمالي بالدولار
+        total_equity_usdt = float(balance.get('info', {}).get('totalEq', 0))
+
+        text = f"**💼 محفظة الحساب ({WORKER_ID})**\n\n**إجمالي الرصيد:** `${total_equity_usdt:,.2f}` USDT\n\n**الأصول:**\n"
+        
         assets = []
         if 'info' in balance and 'details' in balance['info']:
             for asset_data in balance['info']['details']:
                 asset = asset_data.get('ccy')
-                total = float(asset_data.get('eq', 0))
-                if total > 0.01 and asset != 'USDT': # تجاهل الأرصدة الصغيرة جدا
-                    assets.append(f"- **{asset}:** `{total}`")
+                total_value = float(asset_data.get('eq', 0))
+                if total_value > 1.0: # عرض الأصول التي تزيد قيمتها عن 1 دولار
+                    assets.append(f"- **{asset}:** `${total_value:,.2f}`")
         
-        text += "\n".join(assets) if assets else "لا توجد أصول أخرى."
+        text += "\n".join(assets) if assets else "لا توجد أصول ذات قيمة."
 
     except Exception as e:
         logger.error(f"Portfolio fetch error: {e}", exc_info=True)
         text = f"حدث خطأ أثناء جلب المحفظة: {e}"
         
     keyboard = [[InlineKeyboardButton("🔄 تحديث", callback_data="portfolio")], [InlineKeyboardButton("🔙 عودة", callback_data="dashboard")]]
-    await safe_edit_message(query, text, reply_markup=InlineKeyboardMarkup(keyboard))
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    if query:
+        await safe_edit_message(query, text, reply_markup=reply_markup)
+    else:
+        await message.reply_text(text, reply_markup=reply_markup, parse_mode=ParseMode.MARKDOWN)
 
 async def show_active_trades_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    message = update.message
+
     async with aiosqlite.connect(DB_FILE) as conn:
         conn.row_factory = aiosqlite.Row
         trades = await (await conn.execute("SELECT * FROM trades WHERE status = 'active' ORDER BY id DESC")).fetchall()
@@ -411,20 +462,29 @@ async def show_active_trades_command(update: Update, context: ContextTypes.DEFAU
         text = "📈 **الصفقات النشطة:**\n\n"
         for trade in trades:
             entry_price = trade['entry_price']
+            pnl_str = ""
             try:
                 ticker = await bot_data.exchange.fetch_ticker(trade['symbol'])
                 current_price = ticker['last']
-                pnl_percent = (current_price / entry_price - 1) * 100
+                pnl_percent = (current_price / entry_price - 1) * 100 if entry_price > 0 else 0
                 pnl_str = f"({pnl_percent:+.2f}%)"
-            except:
-                pnl_str = ""
+            except Exception as e:
+                logger.warning(f"Could not fetch ticker for PNL on {trade['symbol']}: {e}")
+
             text += f"- `#{trade['id']}` **{trade['symbol']}** {pnl_str}\n"
 
     keyboard = [[InlineKeyboardButton("🔄 تحديث", callback_data="active_trades")], [InlineKeyboardButton("🔙 عودة", callback_data="dashboard")]]
-    await safe_edit_message(query, text, reply_markup=InlineKeyboardMarkup(keyboard))
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    if query:
+        await safe_edit_message(query, text, reply_markup=reply_markup)
+    else:
+        await message.reply_text(text, reply_markup=reply_markup, parse_mode=ParseMode.MARKDOWN)
 
 async def show_history_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    message = update.message
+
     async with aiosqlite.connect(DB_FILE) as conn:
         conn.row_factory = aiosqlite.Row
         trades = await (await conn.execute("SELECT * FROM trades WHERE status != 'active' AND status != 'pending' ORDER BY id DESC LIMIT 10")).fetchall()
@@ -439,7 +499,12 @@ async def show_history_command(update: Update, context: ContextTypes.DEFAULT_TYP
             text += f"{emoji} `#{trade['id']}` **{trade['symbol']}** | PNL: `${pnl:,.2f}`\n"
             
     keyboard = [[InlineKeyboardButton("🔄 تحديث", callback_data="history")], [InlineKeyboardButton("🔙 عودة", callback_data="dashboard")]]
-    await safe_edit_message(query, text, reply_markup=InlineKeyboardMarkup(keyboard))
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    if query:
+        await safe_edit_message(query, text, reply_markup=reply_markup)
+    else:
+        await message.reply_text(text, reply_markup=reply_markup, parse_mode=ParseMode.MARKDOWN)
 
 async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -455,6 +520,20 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
     }
     if data in route_map:
         await route_map[data](update, context)
+
+async def toggle_debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Toggles logging level between INFO and DEBUG."""
+    current_level = logging.getLogger().getEffectiveLevel()
+    if current_level == logging.DEBUG:
+        new_level = logging.INFO
+        level_name = "INFO"
+    else:
+        new_level = logging.DEBUG
+        level_name = "DEBUG"
+    
+    logging.getLogger().setLevel(new_level)
+    await update.message.reply_text(f"تم تغيير وضع التسجيل إلى **{level_name}**.", parse_mode=ParseMode.MARKDOWN)
+    logger.warning(f"Logging level changed to {level_name} by user command.")
 
 # --- التشغيل الرئيسي ---
 async def post_init(application: Application):
@@ -480,7 +559,7 @@ async def post_init(application: Application):
     await asyncio.sleep(5)
     await bot_data.trade_guardian.sync_subscriptions()
 
-    await safe_send_message(f"✅ **[W:{WORKER_ID}] بوت العامل بدأ العمل بنجاح.**\nاضغط /dashboard لعرض لوحة التحكم.")
+    await safe_send_message(f"✅ **[W:{WORKER_ID}] بوت العامل بدأ العمل بنجاح.**\nاستخدم /start لعرض لوحة التحكم.")
     logger.info(f"--- Worker Bot '{WORKER_ID}' is now fully operational ---")
 
 async def post_shutdown(application: Application):
@@ -494,9 +573,20 @@ def main():
     app_builder.post_init(post_init).post_shutdown(post_shutdown)
     application = app_builder.build()
     
+    # أوامر أساسية
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("dashboard", show_dashboard_command))
+    application.add_handler(CommandHandler("debug", toggle_debug_command))
+
+    # معالج الأزرار المضمنة (Inline Buttons)
     application.add_handler(CallbackQueryHandler(button_callback_handler))
+
+    # معالجات الأزرار الثابتة (Reply Buttons)
+    application.add_handler(MessageHandler(filters.Regex(f"^{BTN_TEXT_DASHBOARD}$"), show_dashboard_command))
+    application.add_handler(MessageHandler(filters.Regex(f"^{BTN_TEXT_PORTFOLIO}$"), show_portfolio_command))
+    application.add_handler(MessageHandler(filters.Regex(f"^{BTN_TEXT_ACTIVE}$"), show_active_trades_command))
+    application.add_handler(MessageHandler(filters.Regex(f"^{BTN_TEXT_HISTORY}$"), show_history_command))
+    application.add_handler(MessageHandler(filters.Regex(f"^{BTN_TEXT_STATUS}$"), show_status_command))
     
     application.run_polling()
 
