@@ -9,3 +9,4 @@ websockets
 feedparser
 nltk
 scipy
+python-telegram-bot
