@@ -1,17 +1,13 @@
 # -*- coding: utf-8 -*-
 # =======================================================================================
-# --- 🦾 OKX Enhanced Worker Bot | v2.0 (UI & Guardian Edition) 🦾 ---
+# --- 🦾 OKX Enhanced Worker Bot | v2.1 (Stable Edition) 🦾 ---
 # =======================================================================================
 #
 # هذا البوت هو "اليد" المطورة في نظام "العقل والأيدي".
-# لم يعد مجرد منفذ صامت، بل أصبح محطة مراقبة متكاملة مع واجهة تليجرام خاصة به.
 #
-# --- الميزات الرئيسية ---
-#   ✅ [واجهة] واجهة تليجرام تفاعلية لعرض الحالة، المحفظة، والصفقات.
-#   ✅ [قاعدة بيانات] قاعدة بيانات محلية (SQLite) لتسجيل وتتبع الصفقات التي ينفذها هذا العامل فقط.
-#   ✅ [مراقبة] نظام "الحارس الأمين" (TradeGuardian) مدمج لمتابعة الصفقات النشطة وإغلاقها عند الهدف أو الوقف.
-#   ✅ [اتصال] يستمع باستمرار إلى قناة Redis لاستقبال الإشارات من "العقل" وتنفيذها.
-#   ✅ [استقلالية] يعمل بشكل مستقل تمامًا ويمكن تشغيله على أي سيرفر.
+# --- v2.1 Changelog ---
+#   ✅ [إصلاح] تحسين نظام تسجيل الأحداث (Logging) ليكون أكثر استقرارًا ويتجنب خطأ 'worker_id'
+#      الذي كان يحدث بسبب رسائل مكتبة تليجرام الداخلية.
 #
 # =======================================================================================
 
@@ -32,9 +28,11 @@ from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQuer
 from telegram.error import BadRequest
 
 # --- إعدادات التسجيل (Logging) ---
+# --- [تعديل v2.1] إصلاح خطأ KeyError ---
 class SafeFormatter(logging.Formatter):
     def format(self, record):
         if not hasattr(record, 'trade_id'): record.trade_id = 'N/A'
+        if not hasattr(record, 'worker_id'): record.worker_id = 'N/A'
         return super().format(record)
 
 log_formatter = SafeFormatter('%(asctime)s - %(levelname)s - [%(worker_id)s] - [TradeID:%(trade_id)s] - %(message)s')
@@ -45,7 +43,7 @@ root_logger = logging.getLogger(); root_logger.handlers = [log_handler]; root_lo
 class ContextAdapter(logging.LoggerAdapter):
     def process(self, msg, kwargs):
         if 'extra' not in kwargs: kwargs['extra'] = {}
-        if 'worker_id' not in kwargs['extra']: kwargs['extra']['worker_id'] = 'N/A'
+        # worker_id يتم تمريره عند إنشاء الـ adapter
         if 'trade_id' not in kwargs['extra']: kwargs['extra']['trade_id'] = 'N/A'
         return msg, kwargs
 
@@ -57,7 +55,7 @@ WORKER_ID = os.getenv('WORKER_ID', 'worker_01')
 OKX_API_KEY = os.getenv('WORKER_OKX_API_KEY')
 OKX_API_SECRET = os.getenv('WORKER_OKX_API_SECRET')
 OKX_API_PASSPHRASE = os.getenv('WORKER_OKX_API_PASSPHRASE')
-REDIS_URL = os.getenv('REDIS_URL', 'redis://localhost:6379')
+REDIS_URL = os.getenv('REDIS_URL') # --- [تعديل v2.1] تم حذف القيمة الافتراضية
 WORKER_TELEGRAM_BOT_TOKEN = os.getenv('WORKER_TELEGRAM_BOT_TOKEN')
 WORKER_TELEGRAM_CHAT_ID = os.getenv('WORKER_TELEGRAM_CHAT_ID')
 TRADE_SIZE_USDT = float(os.getenv('WORKER_TRADE_SIZE_USDT', '15.0'))
@@ -86,7 +84,8 @@ trade_management_lock = asyncio.Lock()
 # --- وظائف مساعدة ---
 async def safe_send_message(text, **kwargs):
     try:
-        await bot_data.application.bot.send_message(WORKER_TELEGRAM_CHAT_ID, text, parse_mode=ParseMode.MARKDOWN, **kwargs)
+        if bot_data.application and WORKER_TELEGRAM_CHAT_ID:
+            await bot_data.application.bot.send_message(WORKER_TELEGRAM_CHAT_ID, text, parse_mode=ParseMode.MARKDOWN, **kwargs)
     except Exception as e:
         logger.error(f"Telegram Send Error: {e}")
 
@@ -103,7 +102,6 @@ async def safe_edit_message(query, text, **kwargs):
 async def init_database():
     try:
         async with aiosqlite.connect(DB_FILE) as conn:
-            # تم تبسيط الجدول قليلاً مقارنة بالبوت الرئيسي
             await conn.execute('''
                 CREATE TABLE IF NOT EXISTS trades (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -151,7 +149,7 @@ async def activate_trade(order_id, symbol):
     try:
         order_details = await bot_data.exchange.fetch_order(order_id, symbol)
         filled_price = order_details.get('average', 0.0)
-        net_filled_quantity = order_details.get('filled', 0.0) # تبسيط: افترض أن الرسوم تؤخذ بـ USDT
+        net_filled_quantity = order_details.get('filled', 0.0)
 
         if net_filled_quantity <= 0 or filled_price <= 0:
             logger.error(f"Order {order_id} invalid fill data."); return
@@ -166,7 +164,6 @@ async def activate_trade(order_id, symbol):
             log_ctx['trade_id'] = trade['id']
             logger.info(f"Activating trade #{trade['id']} for {symbol}...", extra=log_ctx)
             
-            # إعادة حساب TP/SL بناءً على سعر التنفيذ الفعلي
             risk = filled_price - trade['stop_loss']
             new_take_profit = filled_price + (risk * RISK_REWARD_RATIO)
 
@@ -218,7 +215,6 @@ class TradeGuardian:
         logger.info(f"Guardian: Closing {symbol}. Reason: {reason}", extra=log_ctx)
         
         try:
-            # جلب الكمية المتاحة من المحفظة لضمان بيع كل شيء
             balance = await bot_data.exchange.fetch_balance()
             asset_to_sell = symbol.split('/')[0]
             available_quantity = balance.get(asset_to_sell, {}).get('free', 0.0)
@@ -262,7 +258,6 @@ class TradeGuardian:
 
 
 class PublicWebSocketManager:
-    # ... (هذا الكود مطابق للبوت الرئيسي، لا داعي لتكراره بالكامل)
     def __init__(self, handler_coro): self.ws_url = "wss://ws.okx.com:8443/ws/v5/public"; self.handler = handler_coro; self.subscriptions = set()
     async def _send_op(self, op, symbols):
         if not symbols or not hasattr(self, 'websocket') or not self.websocket: return
@@ -300,15 +295,9 @@ async def execute_trade_from_signal(signal):
 
     try:
         logger.info(f"Received valid signal for {symbol}. Preparing to execute.")
-        
-        # استخدام حجم الصفقة المحدد في إعدادات هذا العامل
         amount = TRADE_SIZE_USDT / entry_price
-        
-        # تنفيذ أمر الشراء
         order = await bot_data.exchange.create_market_buy_order(symbol, amount)
         logger.info(f"Placed market buy order for {symbol}. Order ID: {order['id']}")
-        
-        # تسجيل الصفقة في قاعدة البيانات المحلية كانتظار
         await log_pending_trade_to_db(signal, order)
 
     except ccxt.InsufficientFunds as e:
@@ -319,6 +308,10 @@ async def execute_trade_from_signal(signal):
 
 # --- مستمع Redis ---
 async def redis_listener():
+    if not REDIS_URL:
+        logger.critical("REDIS_URL is not set in the environment variables. The worker cannot start.")
+        return
+        
     while True:
         try:
             r = redis.from_url(REDIS_URL, health_check_interval=30)
@@ -337,7 +330,7 @@ async def redis_listener():
                     logger.info(f"Received new signal: {signal_data}")
                     asyncio.create_task(execute_trade_from_signal(signal_data))
 
-        except redis.ConnectionError as e:
+        except (redis.ConnectionError, redis.exceptions.InvalidResponse) as e:
             logger.error(f"Redis connection lost: {e}. Reconnecting in 5 seconds...")
             bot_data.redis_connected = False
             await asyncio.sleep(5)
@@ -368,6 +361,7 @@ async def show_dashboard_command(update: Update, context: ContextTypes.DEFAULT_T
         await target_message.reply_text(message_text, reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def show_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
     status_text = "متصل ✅" if bot_data.redis_connected else "غير متصل ❌"
     last_signal_time = bot_data.last_signal_received_at.strftime('%Y-%m-%d %H:%M:%S') if bot_data.last_signal_received_at else "لم يتم استلام أي إشارة بعد"
     
@@ -377,7 +371,7 @@ async def show_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE
             f"**آخر إشارة تم استلامها:** {last_signal_time}")
             
     keyboard = [[InlineKeyboardButton("🔄 تحديث", callback_data="status")], [InlineKeyboardButton("🔙 عودة", callback_data="dashboard")]]
-    await safe_edit_message(update.callback_query, text, reply_markup=InlineKeyboardMarkup(keyboard))
+    await safe_edit_message(query, text, reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def show_portfolio_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -395,6 +389,7 @@ async def show_portfolio_command(update: Update, context: ContextTypes.DEFAULT_T
     await safe_edit_message(query, text, reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def show_active_trades_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
     async with aiosqlite.connect(DB_FILE) as conn:
         conn.row_factory = aiosqlite.Row
         trades = await (await conn.execute("SELECT * FROM trades WHERE status = 'active' ORDER BY id DESC")).fetchall()
@@ -405,7 +400,6 @@ async def show_active_trades_command(update: Update, context: ContextTypes.DEFAU
         text = "📈 **الصفقات النشطة:**\n\n"
         for trade in trades:
             entry_price = trade['entry_price']
-            # جلب السعر الحالي لحساب الربح اللحظي
             try:
                 ticker = await bot_data.exchange.fetch_ticker(trade['symbol'])
                 current_price = ticker['last']
@@ -416,9 +410,10 @@ async def show_active_trades_command(update: Update, context: ContextTypes.DEFAU
             text += f"- `#{trade['id']}` **{trade['symbol']}** {pnl_str}\n"
 
     keyboard = [[InlineKeyboardButton("🔄 تحديث", callback_data="active_trades")], [InlineKeyboardButton("🔙 عودة", callback_data="dashboard")]]
-    await safe_edit_message(update.callback_query, text, reply_markup=InlineKeyboardMarkup(keyboard))
+    await safe_edit_message(query, text, reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def show_history_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
     async with aiosqlite.connect(DB_FILE) as conn:
         conn.row_factory = aiosqlite.Row
         trades = await (await conn.execute("SELECT * FROM trades WHERE status != 'active' AND status != 'pending' ORDER BY id DESC LIMIT 10")).fetchall()
@@ -433,7 +428,7 @@ async def show_history_command(update: Update, context: ContextTypes.DEFAULT_TYP
             text += f"{emoji} `#{trade['id']}` **{trade['symbol']}** | PNL: `${pnl:,.2f}`\n"
             
     keyboard = [[InlineKeyboardButton("🔄 تحديث", callback_data="history")], [InlineKeyboardButton("🔙 عودة", callback_data="dashboard")]]
-    await safe_edit_message(update.callback_query, text, reply_markup=InlineKeyboardMarkup(keyboard))
+    await safe_edit_message(query, text, reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -468,11 +463,10 @@ async def post_init(application: Application):
     bot_data.trade_guardian = TradeGuardian(application)
     bot_data.public_ws = PublicWebSocketManager(bot_data.trade_guardian.handle_ticker_update)
 
-    # بدء المهام الخلفية
     asyncio.create_task(redis_listener())
     asyncio.create_task(bot_data.public_ws.run())
     
-    await asyncio.sleep(5) # انتظر قليلاً لبدء الاتصالات
+    await asyncio.sleep(5)
     await bot_data.trade_guardian.sync_subscriptions()
 
     await safe_send_message(f"✅ **[W:{WORKER_ID}] بوت العامل بدأ العمل بنجاح.**\nاضغط /dashboard لعرض لوحة التحكم.")
@@ -497,3 +491,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+
