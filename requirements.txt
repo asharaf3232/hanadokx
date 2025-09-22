@@ -1,0 +1,11 @@
+python-dotenv
+ccxt
+pandas
+pandas-ta
+redis
+aiosqlite
+httpx
+websockets
+feedparser
+nltk
+scipy
