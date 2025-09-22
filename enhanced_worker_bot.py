@@ -1,13 +1,12 @@
 # -*- coding: utf-8 -*-
 # =======================================================================================
-# --- 🦾 OKX Enhanced Worker Bot | v2.4 (Markdown Fix Edition) 🦾 ---
+# --- 🦾 OKX Enhanced Worker Bot | v2.5 (Final Stable) 🦾 ---
 # =======================================================================================
 #
-# هذا البوت هو "اليد" المطورة في نظام "العقل والأيدي".
-#
-# --- v2.4 Changelog ---
-#   ✅ [إصلاح حرج] إصلاح خطأ "Can't parse entities" الذي يحدث بسبب الحروف الخاصة في `WORKER_ID`.
-#   ✅ [تحسين] إضافة دالة مساعدة لتهريب (escape) نصوص Markdown بشكل آمن.
+# --- v2.5 Changelog ---
+#   ✅ [إصلاح جذري] إعادة كتابة منطق الاتصال بـ Redis لضمان إعادة الاتصال بشكل موثوق عند الفشل.
+#   ✅ [ميزة] إضافة أمر جديد /check لتشخيص حالة اتصال البوت بـ OKX و Redis في أي وقت.
+#   ✅ [تحسين] إضافة رسائل تسجيل أحداث (logs) أكثر تفصيلاً لتسهيل تتبع عملية الاتصال.
 #
 # =======================================================================================
 
@@ -15,38 +14,30 @@ import asyncio
 import os
 import json
 import logging
-import re
 from datetime import datetime
 from zoneinfo import ZoneInfo
 import aiosqlite
 import ccxt.async_support as ccxt
-import redis.asyncio as redis
+import redis.asyncio as aioredis
+from redis.exceptions import ConnectionError as RedisConnectionError
 import websockets.exceptions
 from dotenv import load_dotenv
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
-from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler, MessageHandler, filters
-from telegram.error import BadRequest, Conflict
-
-# --- تحميل متغيرات البيئة ---
-load_dotenv()
-
-# --- إعدادات وضع التصحيح ---
-WORKER_DEBUG_MODE = os.getenv('WORKER_DEBUG_MODE', 'false').lower() == 'true'
+from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler
+from telegram.error import BadRequest
 
 # --- إعدادات التسجيل (Logging) ---
 class SafeFormatter(logging.Formatter):
     def format(self, record):
-        if not hasattr(record, 'trade_id'): record.trade_id = 'N/A'
-        if not hasattr(record, 'worker_id'): record.worker_id = 'N/A'
+        record.worker_id = getattr(record, 'worker_id', 'N/A')
+        record.trade_id = getattr(record, 'trade_id', 'N/A')
         return super().format(record)
 
 log_formatter = SafeFormatter('%(asctime)s - %(levelname)s - [%(worker_id)s] - [TradeID:%(trade_id)s] - %(message)s')
 log_handler = logging.StreamHandler()
 log_handler.setFormatter(log_formatter)
-root_logger = logging.getLogger()
-root_logger.handlers = [log_handler]
-root_logger.setLevel(logging.DEBUG if WORKER_DEBUG_MODE else logging.INFO)
+root_logger = logging.getLogger(); root_logger.handlers = [log_handler]; root_logger.setLevel(logging.INFO)
 
 class ContextAdapter(logging.LoggerAdapter):
     def process(self, msg, kwargs):
@@ -54,6 +45,9 @@ class ContextAdapter(logging.LoggerAdapter):
         kwargs['extra'].setdefault('worker_id', self.extra.get('worker_id', 'N/A'))
         kwargs['extra'].setdefault('trade_id', 'N/A')
         return msg, kwargs
+
+# --- تحميل متغيرات البيئة ---
+load_dotenv()
 
 # --- إعدادات البوت العامل ---
 WORKER_ID = os.getenv('WORKER_ID', 'worker_01')
@@ -71,14 +65,6 @@ DB_FILE = f'okx_worker_{WORKER_ID}.db'
 EGYPT_TZ = ZoneInfo("Africa/Cairo")
 
 logger = ContextAdapter(logging.getLogger(__name__), {'worker_id': WORKER_ID})
-logger.info(f"Logging level set to: {logging.getLevelName(root_logger.level)}")
-
-# --- نصوص الأزرار الثابتة ---
-BTN_TEXT_DASHBOARD = "🖥️ عرض لوحة التحكم"
-BTN_TEXT_PORTFOLIO = "💼 المحفظة"
-BTN_TEXT_ACTIVE = "📈 الصفقات النشطة"
-BTN_TEXT_HISTORY = "📜 سجل الصفقات"
-BTN_TEXT_STATUS = "📡 حالة الاتصال"
 
 # --- الحالة العامة للبوت ---
 class BotState:
@@ -87,6 +73,7 @@ class BotState:
         self.exchange = None
         self.redis_client = None
         self.redis_connected = False
+        self.okx_connected = False
         self.last_signal_received_at = None
         self.trade_guardian = None
         self.public_ws = None
@@ -95,11 +82,6 @@ bot_data = BotState()
 trade_management_lock = asyncio.Lock()
 
 # --- وظائف مساعدة ---
-def escape_markdown(text: str) -> str:
-    """Helper function to escape telegram markdown characters `_` `*` `[` `]` `(` `)` `~` `` ` `` `>` `#` `+` `-` `=` `|` `{` `}` `.` `!`."""
-    escape_chars = r'_*[]()~`>#+-=|{}.!'
-    return re.sub(f'([{re.escape(escape_chars)}])', r'\\\1', text)
-
 async def safe_send_message(text, **kwargs):
     try:
         if bot_data.application and WORKER_TELEGRAM_CHAT_ID:
@@ -116,7 +98,7 @@ async def safe_edit_message(query, text, **kwargs):
     except Exception as e:
         logger.error(f"Edit Message Error: {e}")
 
-# --- إدارة قاعدة البيانات (بدون تغيير) ---
+# --- إدارة قاعدة البيانات ---
 async def init_database():
     try:
         async with aiosqlite.connect(DB_FILE) as conn:
@@ -193,9 +175,8 @@ async def activate_trade(order_id, symbol):
 
         await bot_data.public_ws.subscribe([symbol])
         
-        safe_worker_id = escape_markdown(WORKER_ID)
-        success_msg = (f"✅ **[W:{safe_worker_id}] تم تأكيد الشراء | {escape_markdown(symbol)}**\n\n"
-                       f"🔸 **الصفقة رقم:** `#{trade['id']}`\n"
+        success_msg = (f"✅ **[W:{WORKER_ID}] تم تأكيد الشراء | {symbol}**\n\n"
+                       f"🔸 **الصفقة رقم:** #{trade['id']}\n"
                        f"🔸 **سعر التنفيذ:** `${filled_price:,.4f}`\n"
                        f"🎯 **الهدف (TP):** `${new_take_profit:,.4f}`\n"
                        f"🛡️ **الوقف (SL):** `${trade['stop_loss']:,.4f}`")
@@ -203,6 +184,7 @@ async def activate_trade(order_id, symbol):
 
     except Exception as e:
         logger.error(f"Could not activate trade {order_id}: {e}", exc_info=True, extra=log_ctx)
+
 
 class TradeGuardian:
     def __init__(self, application):
@@ -254,16 +236,14 @@ class TradeGuardian:
             
             await bot_data.public_ws.unsubscribe([symbol])
 
-            safe_worker_id = escape_markdown(WORKER_ID)
-            msg = (f"{emoji} **[W:{safe_worker_id}] تم إغلاق الصفقة | `#{trade_id}` {escape_markdown(symbol)}**\n"
+            msg = (f"{emoji} **[W:{WORKER_ID}] تم إغلاق الصفقة | #{trade_id} {symbol}**\n"
                    f"**السبب:** {reason}\n"
                    f"**الربح/الخسارة:** `${pnl:,.2f}` ({pnl_percent:+.2f}%)")
             await safe_send_message(msg)
 
         except Exception as e:
             logger.error(f"Failed to close trade #{trade_id}: {e}", exc_info=True, extra=log_ctx)
-            safe_worker_id = escape_markdown(WORKER_ID)
-            await safe_send_message(f"🚨 **[W:{safe_worker_id}] فشل حرج** 🚨\nفشل إغلاق الصفقة `#{trade_id}`. الرجاء مراجعة المنصة يدوياً.")
+            await safe_send_message(f"🚨 **[W:{WORKER_ID}] فشل حرج** 🚨\nفشل إغلاق الصفقة `#{trade_id}`. الرجاء مراجعة المنصة يدوياً.")
             
     async def sync_subscriptions(self):
         try:
@@ -275,6 +255,7 @@ class TradeGuardian:
                 await bot_data.public_ws.subscribe(active_symbols)
         except Exception as e:
             logger.error(f"Guardian Sync Error: {e}")
+
 
 class PublicWebSocketManager:
     def __init__(self, handler_coro): self.ws_url = "wss://ws.okx.com:8443/ws/v5/public"; self.handler = handler_coro; self.subscriptions = set()
@@ -302,6 +283,7 @@ class PublicWebSocketManager:
             try: await self._run_loop()
             except Exception as e: logger.error(f"Public WS failed: {e}. Retrying..."); await asyncio.sleep(5)
 
+
 # --- منطق استقبال الإشارات وتنفيذها ---
 async def execute_trade_from_signal(signal):
     symbol = signal.get('symbol')
@@ -320,23 +302,27 @@ async def execute_trade_from_signal(signal):
 
     except ccxt.InsufficientFunds as e:
         logger.error(f"Insufficient funds for {symbol}. Error: {e}")
-        safe_worker_id = escape_markdown(WORKER_ID)
-        await safe_send_message(f"🚨 **[W:{safe_worker_id}] رصيد غير كافٍ** 🚨\nفشل تنفيذ صفقة `{escape_markdown(symbol)}`.")
+        await safe_send_message(f"🚨 **[W:{WORKER_ID}] رصيد غير كافٍ** 🚨\nفشل تنفيذ صفقة `{symbol}`.")
     except Exception as e:
         logger.error(f"Trade execution failed for {symbol}: {e}", exc_info=True)
 
-# --- مستمع Redis (بدون تغيير) ---
+# --- مستمع Redis ---
 async def redis_listener():
     if not REDIS_URL:
         logger.critical("REDIS_URL is not set in the environment variables. The worker cannot start.")
+        bot_data.redis_connected = False
         return
         
     while True:
         try:
-            r = redis.from_url(REDIS_URL, health_check_interval=30)
+            logger.info("Attempting to connect to Redis...")
+            r = aioredis.from_url(REDIS_URL, health_check_interval=30, decode_responses=True)
+            bot_data.redis_client = r
+            
             await r.ping()
+
             bot_data.redis_connected = True
-            logger.info("Successfully connected to Redis.")
+            logger.info("✅ Successfully connected to Redis.")
             
             pubsub = r.pubsub()
             await pubsub.subscribe(REDIS_CHANNEL)
@@ -346,32 +332,45 @@ async def redis_listener():
                 if message['type'] == 'message':
                     bot_data.last_signal_received_at = datetime.now(EGYPT_TZ)
                     signal_data = json.loads(message['data'])
-                    logger.debug(f"Received new signal raw data: {signal_data}")
+                    logger.info(f"Received new signal: {signal_data}")
                     asyncio.create_task(execute_trade_from_signal(signal_data))
 
-        except redis.ConnectionError as e:
+        except RedisConnectionError as e:
             logger.error(f"Redis connection lost: {e}. Reconnecting in 5 seconds...")
             bot_data.redis_connected = False
+            if bot_data.redis_client: await bot_data.redis_client.close()
             await asyncio.sleep(5)
         except Exception as e:
-            logger.error(f"An error occurred in the Redis listener: {e}. Restarting loop in 10 seconds...")
+            logger.error(f"An error occurred in the Redis listener: {e}. Restarting loop in 10 seconds...", exc_info=True)
             bot_data.redis_connected = False
+            if bot_data.redis_client: await bot_data.redis_client.close()
             await asyncio.sleep(10)
 
 # --- واجهة تليجرام ---
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [
-        [KeyboardButton(BTN_TEXT_DASHBOARD)],
-        [KeyboardButton(BTN_TEXT_PORTFOLIO), KeyboardButton(BTN_TEXT_ACTIVE)],
-        [KeyboardButton(BTN_TEXT_HISTORY), KeyboardButton(BTN_TEXT_STATUS)],
-    ]
-    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-    safe_worker_id = escape_markdown(WORKER_ID)
-    await update.message.reply_text(
-        f"👋 أهلاً بك في بوت العامل **{safe_worker_id}**\.\nاستخدم الأزرار بالأسفل للتحكم\.",
-        reply_markup=reply_markup,
-        parse_mode=ParseMode.MARKDOWN
-    )
+    await update.message.reply_text(f"👋 أهلاً بك في بوت العامل **{WORKER_ID}**.\nاضغط /dashboard لعرض لوحة التحكم.")
+
+async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """[NEW] Diagnostic command."""
+    await update.message.reply_text("جاري فحص حالة البوت...")
+    
+    # Check OKX connection
+    try:
+        await bot_data.exchange.fetch_balance(limit=1)
+        bot_data.okx_connected = True
+        okx_status = "متصل ✅"
+    except Exception as e:
+        bot_data.okx_connected = False
+        okx_status = f"غير متصل ❌\n`{e}`"
+
+    # Check Redis connection status (already maintained by the listener loop)
+    redis_status = "متصل ✅" if bot_data.redis_connected else "غير متصل ❌"
+
+    text = (f"**⚙️ تقرير حالة العامل: {WORKER_ID}**\n\n"
+            f"**اتصال OKX:** {okx_status}\n"
+            f"**اتصال Redis (العقل):** {redis_status}")
+            
+    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
 async def show_dashboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status_emoji = "✅" if bot_data.redis_connected else "❌"
@@ -382,79 +381,54 @@ async def show_dashboard_command(update: Update, context: ContextTypes.DEFAULT_T
         [InlineKeyboardButton("الصفقات النشطة 📈", callback_data="active_trades")],
         [InlineKeyboardButton("سجل الصفقات 📜", callback_data="history")]
     ]
-    safe_worker_id = escape_markdown(WORKER_ID)
-    message_text = f"🖥️ **لوحة تحكم العامل: {safe_worker_id}**\n\nاختر أحد الخيارات لعرض التفاصيل\."
+    message_text = f"🖥️ **لوحة تحكم العامل: {WORKER_ID}**"
     
+    target_message = update.message or update.callback_query.message
     if update.callback_query:
         await safe_edit_message(update.callback_query, message_text, reply_markup=InlineKeyboardMarkup(keyboard))
     else:
-        await update.message.reply_text(message_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
+        await target_message.reply_text(message_text, reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def show_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    message = update.message
-    
     status_text = "متصل ✅" if bot_data.redis_connected else "غير متصل ❌"
     last_signal_time = bot_data.last_signal_received_at.strftime('%Y-%m-%d %H:%M:%S') if bot_data.last_signal_received_at else "لم يتم استلام أي إشارة بعد"
     
-    safe_worker_id = escape_markdown(WORKER_ID)
     text = (f"**📡 حالة الاتصال بالعقل**\n\n"
-            f"**معرف العامل:** `{safe_worker_id}`\n"
+            f"**معرف العامل:** `{WORKER_ID}`\n"
             f"**حالة Redis:** {status_text}\n"
             f"**آخر إشارة تم استلامها:** {last_signal_time}")
             
     keyboard = [[InlineKeyboardButton("🔄 تحديث", callback_data="status")], [InlineKeyboardButton("🔙 عودة", callback_data="dashboard")]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    if query:
-        await safe_edit_message(query, text, reply_markup=reply_markup)
-    else:
-        await message.reply_text(text, reply_markup=reply_markup, parse_mode=ParseMode.MARKDOWN)
+    await safe_edit_message(query, text, reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def show_portfolio_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    message = update.message
-    
-    if query:
-        await query.answer("جاري جلب بيانات المحفظة...")
-    else:
-        await message.reply_text("جاري جلب بيانات المحفظة...")
-
+    await query.answer("جاري جلب بيانات المحفظة...")
     try:
         balance = await bot_data.exchange.fetch_balance()
-        logger.debug(f"Full balance response: {balance}")
-        
-        total_equity_usdt = float(balance.get('info', {}).get('totalEq', 0))
-
-        safe_worker_id = escape_markdown(WORKER_ID)
-        text = f"**💼 محفظة الحساب ({safe_worker_id})**\n\n**إجمالي الرصيد:** `${total_equity_usdt:,.2f}` USDT\n\n**الأصول:**\n"
+        total_usdt_equity = balance.get('USDT', {}).get('total', 0)
+        text = f"**💼 محفظة الحساب ({WORKER_ID})**\n\n**إجمالي الرصيد:** `${total_usdt_equity:,.2f}` USDT\n\n**الأصول الأخرى:**\n"
         
         assets = []
-        if 'info' in balance and 'details' in balance['info']:
-            for asset_data in balance['info']['details']:
+        if 'info' in balance and 'totalEq' in balance['info']:
+            for asset_data in balance['info'].get('details', []):
                 asset = asset_data.get('ccy')
-                total_value = float(asset_data.get('eq', 0))
-                if total_value > 1.0:
-                    assets.append(f"\\- **{escape_markdown(asset)}:** `${total_value:,.2f}`")
+                total_balance = float(asset_data.get('eq', 0))
+                if total_balance > 0.01 and asset != 'USDT':
+                    assets.append(f"- **{asset}:** `{total_balance}`")
         
-        text += "\n".join(assets) if assets else "لا توجد أصول ذات قيمة."
+        text += "\n".join(assets) if assets else "لا توجد أصول أخرى."
 
     except Exception as e:
         logger.error(f"Portfolio fetch error: {e}", exc_info=True)
-        text = f"حدث خطأ أثناء جلب المحفظة: {escape_markdown(str(e))}"
+        text = f"حدث خطأ أثناء جلب المحفظة: {e}"
         
     keyboard = [[InlineKeyboardButton("🔄 تحديث", callback_data="portfolio")], [InlineKeyboardButton("🔙 عودة", callback_data="dashboard")]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    if query:
-        await safe_edit_message(query, text, reply_markup=reply_markup)
-    else:
-        await message.reply_text(text, reply_markup=reply_markup, parse_mode=ParseMode.MARKDOWN)
+    await safe_edit_message(query, text, reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def show_active_trades_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    message = update.message
-
     async with aiosqlite.connect(DB_FILE) as conn:
         conn.row_factory = aiosqlite.Row
         trades = await (await conn.execute("SELECT * FROM trades WHERE status = 'active' ORDER BY id DESC")).fetchall()
@@ -465,29 +439,20 @@ async def show_active_trades_command(update: Update, context: ContextTypes.DEFAU
         text = "📈 **الصفقات النشطة:**\n\n"
         for trade in trades:
             entry_price = trade['entry_price']
-            pnl_str = ""
             try:
                 ticker = await bot_data.exchange.fetch_ticker(trade['symbol'])
                 current_price = ticker['last']
-                pnl_percent = (current_price / entry_price - 1) * 100 if entry_price > 0 else 0
+                pnl_percent = (current_price / entry_price - 1) * 100
                 pnl_str = f"({pnl_percent:+.2f}%)"
-            except Exception as e:
-                logger.warning(f"Could not fetch ticker for PNL on {trade['symbol']}: {e}")
-
-            text += f"\\- `#{trade['id']}` **{escape_markdown(trade['symbol'])}** {escape_markdown(pnl_str)}\n"
+            except:
+                pnl_str = ""
+            text += f"- `#{trade['id']}` **{trade['symbol']}** {pnl_str}\n"
 
     keyboard = [[InlineKeyboardButton("🔄 تحديث", callback_data="active_trades")], [InlineKeyboardButton("🔙 عودة", callback_data="dashboard")]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    if query:
-        await safe_edit_message(query, text, reply_markup=reply_markup)
-    else:
-        await message.reply_text(text, reply_markup=reply_markup, parse_mode=ParseMode.MARKDOWN)
+    await safe_edit_message(query, text, reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def show_history_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    message = update.message
-
     async with aiosqlite.connect(DB_FILE) as conn:
         conn.row_factory = aiosqlite.Row
         trades = await (await conn.execute("SELECT * FROM trades WHERE status != 'active' AND status != 'pending' ORDER BY id DESC LIMIT 10")).fetchall()
@@ -499,15 +464,10 @@ async def show_history_command(update: Update, context: ContextTypes.DEFAULT_TYP
         for trade in trades:
             pnl = trade['pnl_usdt'] or 0.0
             emoji = "✅" if pnl >= 0 else "🛑"
-            text += f"{emoji} `#{trade['id']}` **{escape_markdown(trade['symbol'])}** | PNL: `${pnl:,.2f}`\n"
+            text += f"{emoji} `#{trade['id']}` **{trade['symbol']}** | PNL: `${pnl:,.2f}`\n"
             
     keyboard = [[InlineKeyboardButton("🔄 تحديث", callback_data="history")], [InlineKeyboardButton("🔙 عودة", callback_data="dashboard")]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    if query:
-        await safe_edit_message(query, text, reply_markup=reply_markup)
-    else:
-        await message.reply_text(text, reply_markup=reply_markup, parse_mode=ParseMode.MARKDOWN)
+    await safe_edit_message(query, text, reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -524,19 +484,6 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
     if data in route_map:
         await route_map[data](update, context)
 
-async def toggle_debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    current_level = logging.getLogger().getEffectiveLevel()
-    if current_level == logging.DEBUG:
-        new_level = logging.INFO
-        level_name = "INFO"
-    else:
-        new_level = logging.DEBUG
-        level_name = "DEBUG"
-    
-    logging.getLogger().setLevel(new_level)
-    await update.message.reply_text(f"تم تغيير وضع التسجيل إلى **{level_name}**\.", parse_mode=ParseMode.MARKDOWN)
-    logger.warning(f"Logging level changed to {level_name} by user command.")
-
 # --- التشغيل الرئيسي ---
 async def post_init(application: Application):
     bot_data.application = application
@@ -548,8 +495,10 @@ async def post_init(application: Application):
     try:
         bot_data.exchange = ccxt.okx({'apiKey': OKX_API_KEY, 'secret': OKX_API_SECRET, 'password': OKX_API_PASSPHRASE, 'enableRateLimit': True})
         await bot_data.exchange.load_markets()
+        bot_data.okx_connected = True
         logger.info("Successfully connected to OKX.")
     except Exception as e:
+        bot_data.okx_connected = False
         logger.critical(f"Could not connect to OKX: {e}", exc_info=True); return
         
     bot_data.trade_guardian = TradeGuardian(application)
@@ -561,8 +510,7 @@ async def post_init(application: Application):
     await asyncio.sleep(5)
     await bot_data.trade_guardian.sync_subscriptions()
 
-    safe_worker_id = escape_markdown(WORKER_ID)
-    await safe_send_message(f"✅ **[W:{safe_worker_id}] بوت العامل بدأ العمل بنجاح\.**\nاستخدم /start لعرض لوحة التحكم\.")
+    await safe_send_message(f"✅ **[W:{WORKER_ID}] بوت العامل بدأ العمل بنجاح.**\nاضغط /dashboard أو /check لعرض الحالة.")
     logger.info(f"--- Worker Bot '{WORKER_ID}' is now fully operational ---")
 
 async def post_shutdown(application: Application):
@@ -578,15 +526,9 @@ def main():
     
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("dashboard", show_dashboard_command))
-    application.add_handler(CommandHandler("debug", toggle_debug_command))
-
+    application.add_handler(CommandHandler("check", check_command)) # [NEW]
+    
     application.add_handler(CallbackQueryHandler(button_callback_handler))
-
-    application.add_handler(MessageHandler(filters.Regex(f"^{BTN_TEXT_DASHBOARD}$"), show_dashboard_command))
-    application.add_handler(MessageHandler(filters.Regex(f"^{BTN_TEXT_PORTFOLIO}$"), show_portfolio_command))
-    application.add_handler(MessageHandler(filters.Regex(f"^{BTN_TEXT_ACTIVE}$"), show_active_trades_command))
-    application.add_handler(MessageHandler(filters.Regex(f"^{BTN_TEXT_HISTORY}$"), show_history_command))
-    application.add_handler(MessageHandler(filters.Regex(f"^{BTN_TEXT_STATUS}$"), show_status_command))
     
     application.run_polling()
 
