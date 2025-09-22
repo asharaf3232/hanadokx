@@ -1,12 +1,14 @@
 # -*- coding: utf-8 -*-
 # =======================================================================================
-# --- 🦾 OKX Enhanced Worker Bot | v2.3 (Final Fix) 🦾 ---
+# --- 🦾 OKX Enhanced Worker Bot | v2.2 (Final Fix Edition) 🦾 ---
 # =======================================================================================
 #
-# --- v2.3 Changelog ---
+# هذا البوت هو "اليد" المطورة في نظام "العقل والأيدي".
+#
+# --- v2.2 Changelog ---
 #   ✅ [إصلاح] إصلاح خطأ 'total' الذي كان يحدث عند عرض المحفظة.
-#   ✅ [إصلاح] تصحيح مسار استثناءات مكتبة Redis لتجنب خطأ AttributeError.
-#   ✅ [تحسين] تحسين نظام تسجيل الأحداث (Logging) ليكون أكثر استقرارًا.
+#   ✅ [إصلاح] إصلاح خطأ التعامل مع استثناءات Redis (AttributeError).
+#   ✅ [إصلاح] إصلاح نهائي لخطأ 'worker_id' في نظام التسجيل (Logging).
 #
 # =======================================================================================
 
@@ -18,13 +20,13 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 import aiosqlite
 import ccxt.async_support as ccxt
-import redis
+import redis.asyncio as redis
 import websockets.exceptions
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler
-from telegram.error import BadRequest
+from telegram.error import BadRequest, Conflict
 
 # --- إعدادات التسجيل (Logging) ---
 class SafeFormatter(logging.Formatter):
@@ -41,7 +43,8 @@ root_logger = logging.getLogger(); root_logger.handlers = [log_handler]; root_lo
 class ContextAdapter(logging.LoggerAdapter):
     def process(self, msg, kwargs):
         if 'extra' not in kwargs: kwargs['extra'] = {}
-        if 'trade_id' not in kwargs['extra']: kwargs['extra']['trade_id'] = 'N/A'
+        kwargs['extra'].setdefault('worker_id', self.extra.get('worker_id', 'N/A'))
+        kwargs['extra'].setdefault('trade_id', 'N/A')
         return msg, kwargs
 
 # --- تحميل متغيرات البيئة ---
@@ -327,7 +330,7 @@ async def redis_listener():
                     logger.info(f"Received new signal: {signal_data}")
                     asyncio.create_task(execute_trade_from_signal(signal_data))
 
-        except (redis.ConnectionError, redis.exceptions.InvalidResponse) as e:
+        except redis.ConnectionError as e:
             logger.error(f"Redis connection lost: {e}. Reconnecting in 5 seconds...")
             bot_data.redis_connected = False
             await asyncio.sleep(5)
@@ -380,11 +383,11 @@ async def show_portfolio_command(update: Update, context: ContextTypes.DEFAULT_T
         
         # --- [إصلاح v2.2] تعديل طريقة قراءة الأرصدة ---
         assets = []
-        if 'info' in balance and 'totalEq' in balance['info']:
-            for asset_data in balance['info'].get('details', []):
+        if 'info' in balance and 'details' in balance['info']:
+            for asset_data in balance['info']['details']:
                 asset = asset_data.get('ccy')
                 total = float(asset_data.get('eq', 0))
-                if total > 0.01 and asset != 'USDT': # عرض الأصول التي تزيد قيمتها عن سنت واحد
+                if total > 0.01 and asset != 'USDT': # تجاهل الأرصدة الصغيرة جدا
                     assets.append(f"- **{asset}:** `{total}`")
         
         text += "\n".join(assets) if assets else "لا توجد أصول أخرى."
@@ -499,4 +502,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
