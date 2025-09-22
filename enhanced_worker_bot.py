@@ -1,13 +1,12 @@
 # -*- coding: utf-8 -*-
 # =======================================================================================
-# --- 🦾 OKX Enhanced Worker Bot | v2.2 (Stable Edition) 🦾 ---
+# --- 🦾 OKX Enhanced Worker Bot | v2.3 (Final Fix) 🦾 ---
 # =======================================================================================
 #
-# هذا البوت هو "اليد" المطورة في نظام "العقل والأيدي".
-#
-# --- v2.2 Changelog ---
-#   ✅ [إصلاح] إصلاح خطأ 'total' الذي كان يحدث عند عرض المحفظة بسبب قراءة خاطئة لبيانات CCXT.
-#   ✅ [تحسين] تحسين رسائل الأخطاء لتكون أكثر وضوحًا.
+# --- v2.3 Changelog ---
+#   ✅ [إصلاح] إصلاح خطأ 'total' الذي كان يحدث عند عرض المحفظة.
+#   ✅ [إصلاح] تصحيح مسار استثناءات مكتبة Redis لتجنب خطأ AttributeError.
+#   ✅ [تحسين] تحسين نظام تسجيل الأحداث (Logging) ليكون أكثر استقرارًا.
 #
 # =======================================================================================
 
@@ -19,7 +18,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 import aiosqlite
 import ccxt.async_support as ccxt
-import redis.asyncio as redis
+import redis
 import websockets.exceptions
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -381,11 +380,13 @@ async def show_portfolio_command(update: Update, context: ContextTypes.DEFAULT_T
         
         # --- [إصلاح v2.2] تعديل طريقة قراءة الأرصدة ---
         assets = []
-        for asset, data in balance.items():
-            if isinstance(data, dict) and 'total' in data:
-                if data['total'] > 0 and asset != 'USDT':
-                    assets.append(f"- **{asset}:** `{data['total']}`")
-
+        if 'info' in balance and 'totalEq' in balance['info']:
+            for asset_data in balance['info'].get('details', []):
+                asset = asset_data.get('ccy')
+                total = float(asset_data.get('eq', 0))
+                if total > 0.01 and asset != 'USDT': # عرض الأصول التي تزيد قيمتها عن سنت واحد
+                    assets.append(f"- **{asset}:** `{total}`")
+        
         text += "\n".join(assets) if assets else "لا توجد أصول أخرى."
 
     except Exception as e:
