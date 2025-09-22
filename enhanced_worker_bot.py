@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
 # =======================================================================================
-# --- 🦾 OKX Enhanced Worker Bot | v2.1 (Stable Edition) 🦾 ---
+# --- 🦾 OKX Enhanced Worker Bot | v2.2 (Stable Edition) 🦾 ---
 # =======================================================================================
 #
 # هذا البوت هو "اليد" المطورة في نظام "العقل والأيدي".
 #
-# --- v2.1 Changelog ---
-#   ✅ [إصلاح] تحسين نظام تسجيل الأحداث (Logging) ليكون أكثر استقرارًا ويتجنب خطأ 'worker_id'
-#      الذي كان يحدث بسبب رسائل مكتبة تليجرام الداخلية.
+# --- v2.2 Changelog ---
+#   ✅ [إصلاح] إصلاح خطأ 'total' الذي كان يحدث عند عرض المحفظة بسبب قراءة خاطئة لبيانات CCXT.
+#   ✅ [تحسين] تحسين رسائل الأخطاء لتكون أكثر وضوحًا.
 #
 # =======================================================================================
 
@@ -28,7 +28,6 @@ from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQuer
 from telegram.error import BadRequest
 
 # --- إعدادات التسجيل (Logging) ---
-# --- [تعديل v2.1] إصلاح خطأ KeyError ---
 class SafeFormatter(logging.Formatter):
     def format(self, record):
         if not hasattr(record, 'trade_id'): record.trade_id = 'N/A'
@@ -43,7 +42,6 @@ root_logger = logging.getLogger(); root_logger.handlers = [log_handler]; root_lo
 class ContextAdapter(logging.LoggerAdapter):
     def process(self, msg, kwargs):
         if 'extra' not in kwargs: kwargs['extra'] = {}
-        # worker_id يتم تمريره عند إنشاء الـ adapter
         if 'trade_id' not in kwargs['extra']: kwargs['extra']['trade_id'] = 'N/A'
         return msg, kwargs
 
@@ -55,7 +53,7 @@ WORKER_ID = os.getenv('WORKER_ID', 'worker_01')
 OKX_API_KEY = os.getenv('WORKER_OKX_API_KEY')
 OKX_API_SECRET = os.getenv('WORKER_OKX_API_SECRET')
 OKX_API_PASSPHRASE = os.getenv('WORKER_OKX_API_PASSPHRASE')
-REDIS_URL = os.getenv('REDIS_URL') # --- [تعديل v2.1] تم حذف القيمة الافتراضية
+REDIS_URL = os.getenv('REDIS_URL')
 WORKER_TELEGRAM_BOT_TOKEN = os.getenv('WORKER_TELEGRAM_BOT_TOKEN')
 WORKER_TELEGRAM_CHAT_ID = os.getenv('WORKER_TELEGRAM_CHAT_ID')
 TRADE_SIZE_USDT = float(os.getenv('WORKER_TRADE_SIZE_USDT', '15.0'))
@@ -380,9 +378,18 @@ async def show_portfolio_command(update: Update, context: ContextTypes.DEFAULT_T
         balance = await bot_data.exchange.fetch_balance()
         total_usdt_equity = balance.get('USDT', {}).get('total', 0)
         text = f"**💼 محفظة الحساب ({WORKER_ID})**\n\n**إجمالي الرصيد:** `${total_usdt_equity:,.2f}` USDT\n\n**الأصول الأخرى:**\n"
-        assets = [f"- **{asset}:** `{data['total']}`" for asset, data in balance.items() if data['total'] > 0 and asset != 'USDT']
+        
+        # --- [إصلاح v2.2] تعديل طريقة قراءة الأرصدة ---
+        assets = []
+        for asset, data in balance.items():
+            if isinstance(data, dict) and 'total' in data:
+                if data['total'] > 0 and asset != 'USDT':
+                    assets.append(f"- **{asset}:** `{data['total']}`")
+
         text += "\n".join(assets) if assets else "لا توجد أصول أخرى."
+
     except Exception as e:
+        logger.error(f"Portfolio fetch error: {e}", exc_info=True)
         text = f"حدث خطأ أثناء جلب المحفظة: {e}"
         
     keyboard = [[InlineKeyboardButton("🔄 تحديث", callback_data="portfolio")], [InlineKeyboardButton("🔙 عودة", callback_data="dashboard")]]
