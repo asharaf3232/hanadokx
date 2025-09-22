@@ -1,57 +1,61 @@
 # -*- coding: utf-8 -*-
 # =======================================================================================
-# --- 🤖 OKX Worker UI Bot | v1.1 (مع تأكيدات الاتصال) 🤖 ---
+# --- 🤖 OKX Worker UI Bot | v1.0 🤖 ---
 # =======================================================================================
-# v1.1 Changelog:
-#   ✅ [إضافة] رسالة "نبض قلب" (Heartbeat) دورية كل ساعة للتأكد من استمرارية الاتصال.
-#   ✅ [تحسين] رسالة بدء تشغيل أكثر تفصيلاً تؤكد نجاح كل اتصال على حدة.
-#   ✅ [تحسين] تقرير التشخيص أصبح يقوم بفحص "حي" للاتصالات ويعرض بيانات إضافية.
+# هذا البوت هو "الذراع المنفذة" مع واجهة تليجرام متكاملة.
+# - يستمع للإشارات من "بوت العقل" عبر Redis.
+# - ينفذ الصفقات على حساب المستخدم الخاص.
+# - يوفر واجهة تليجرام للمستخدم لمتابعة المحفظة، الصفقات، والأداء.
+# - يحتفظ بقاعدة بيانات محلية خاصة بصفقات المستخدم فقط.
 # =======================================================================================
 
 import asyncio
 import json
 import os
 import logging
-from datetime import datetime, time as dt_time
+from datetime import datetime
 from zoneinfo import ZoneInfo
 import aiosqlite
 import ccxt.async_support as ccxt
 import redis.asyncio as redis
 from dotenv import load_dotenv
+import pandas as pd
 
 from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters, CallbackQueryHandler
+from telegram.error import BadRequest
 
 # --- ⚙️ الإعدادات والتهيئة ⚙️ ---
 load_dotenv()
 
+# --- مفاتيح خاصة بالمستخدم (يجب وضعها في ملف .env) ---
 OKX_API_KEY = os.getenv('OKX_API_KEY')
 OKX_API_SECRET = os.getenv('OKX_API_SECRET')
-OKX_API_PASSPHONSE = os.getenv('OKX_API_PASSPHONSE') # خطأ إملائي شائع، تأكد من أنه PASSPHRASE في ملفك
-OKX_API_PASSPHRASE = os.getenv('OKX_API_PASSPHRASE', OKX_API_PASSPHONSE)
-REDIS_URL = os.getenv('REDIS_URL')
-TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
-TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
+OKX_API_PASSPHRASE = os.getenv('OKX_API_PASSPHRASE')
+REDIS_URL = os.getenv('REDIS_URL') # نفس رابط ريديس الخاص بـ "بوت العقل"
+TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN') # التوكن الخاص ببوت المستخدم
+TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID') # Chat ID الخاص بالمستخدم
 
+# --- إعدادات عامة ---
 DB_FILE = 'my_trades.db'
 EGYPT_TZ = ZoneInfo("Africa/Cairo")
-TRADE_SIZE_USDT = float(os.getenv('TRADE_SIZE_USDT', '15.0'))
-HEARTBEAT_INTERVAL_SECONDS = 3600 # [تعديل] إرسال نبض القلب كل ساعة
+TRADE_SIZE_USDT = float(os.getenv('TRADE_SIZE_USDT', '15.0')) # يمكن للمستخدم تحديد حجم صفقته
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
+# --- 🏦 إدارة الحالة والاتصالات 🏦 ---
 class WorkerState:
     def __init__(self):
         self.exchange = None
         self.redis_client = None
         self.telegram_app = None
-        self.connections = {"okx": "Connecting...", "redis": "Connecting..."}
+        self.connections = {"okx": "Disconnected 🔴", "redis": "Disconnected 🔴"}
 
 worker_state = WorkerState()
 
+# --- 🗃️ إدارة قاعدة البيانات المحلية 🗃️ ---
 async def init_database():
-    # ... (الكود كما هو)
     async with aiosqlite.connect(DB_FILE) as conn:
         await conn.execute('''
             CREATE TABLE IF NOT EXISTS trades (
@@ -69,8 +73,11 @@ async def init_database():
         await conn.commit()
     logging.info("Local database initialized successfully.")
 
+# --- 📡 قلب البوت: مستمع Redis ومنفذ الصفقات ---
 async def execute_trade(signal):
-    # ... (الكود كما هو)
+    """
+    ينفذ الصفقة ويحفظها في قاعدة البيانات المحلية
+    """
     try:
         symbol = signal['symbol']
         entry_price = signal['entry_price']
@@ -81,12 +88,13 @@ async def execute_trade(signal):
         logging.info(f"Signal for {symbol}. Placing market buy order for {formatted_amount} units.")
         order = await worker_state.exchange.create_market_buy_order(symbol, formatted_amount)
         
+        # انتظار تأكيد تنفيذ الأمر للحصول على السعر والكمية الفعلية
         filled_order = await worker_state.exchange.fetch_order(order['id'], symbol)
         actual_price = filled_order.get('average', entry_price)
         actual_quantity = filled_order.get('filled', 0)
 
         if actual_quantity > 0:
-            async with aiosqlite.connect(DB_FILE) as conn:
+            async with aiosqlite.connect(DB_File) as conn:
                 await conn.execute(
                     "INSERT INTO trades (timestamp, symbol, entry_price, quantity, status, okx_order_id) VALUES (?, ?, ?, ?, ?, ?)",
                     (datetime.now(EGYPT_TZ).isoformat(), symbol, actual_price, actual_quantity, 'active', order['id'])
@@ -98,7 +106,8 @@ async def execute_trade(signal):
                 f"**العملة:** `{symbol}`\n"
                 f"**سعر التنفيذ الفعلي:** `${actual_price:,.4f}`\n"
                 f"**الكمية:** `{actual_quantity:,.4f}`\n"
-                f"**التكلفة:** `≈ ${TRADE_SIZE_USDT:,.2f}`"
+                f"**التكلفة:** `≈ ${TRADE_SIZE_USDT:,.2f}`\n\n"
+                f"ℹ️ *تم استلام هذه الإشارة من البوت الرئيسي. هذه الصفقة مُدارة الآن محلياً.*"
             )
             await safe_send_message(worker_state.telegram_app.bot, success_msg)
         else:
@@ -109,15 +118,15 @@ async def execute_trade(signal):
         await safe_send_message(worker_state.telegram_app.bot, f"🚨 فشل تنفيذ صفقة لـ `{signal['symbol']}`. السبب: {e}")
 
 async def redis_listener():
+    """
+    يستمع باستمرار لقناة Redis وعند وصول رسالة يمررها للتنفيذ
+    """
     while True:
         try:
             worker_state.redis_client = redis.from_url(REDIS_URL, decode_responses=True)
-            await worker_state.redis_client.ping() # التأكد من الاتصال
             pubsub = worker_state.redis_client.pubsub()
             await pubsub.subscribe("trade_signals")
-            worker_state.connections["redis"] = "Connected & Listening 🟢"
-            # [تعديل] إرسال رسالة تأكيد عند نجاح الاتصال والاستماع
-            await safe_send_message(worker_state.telegram_app.bot, "✅ **اتصال Redis ناجح.** البوت يستمع الآن للإشارات.")
+            worker_state.connections["redis"] = "Connected 🟢"
             logging.info("Redis listener connected. Waiting for signals...")
             
             while True:
@@ -131,51 +140,24 @@ async def redis_listener():
                         logging.error(f"Error processing signal: {e}")
 
         except Exception as e:
-            worker_state.connections["redis"] = f"Disconnected 🔴 ({e})"
+            worker_state.connections["redis"] = "Disconnected 🔴"
             logging.error(f"Redis connection failed: {e}. Reconnecting in 15 seconds...")
             await asyncio.sleep(15)
 
-# --- [تعديل] دالة نبض القلب الدورية ---
-async def heartbeat_check(context: ContextTypes.DEFAULT_TYPE):
-    """
-    تقوم بفحص الاتصالات بشكل دوري وإرسال رسالة تأكيد للمستخدم
-    """
-    okx_status = "Offline 🔴"
-    redis_status = "Offline 🔴"
-    
-    # فحص OKX
-    try:
-        await worker_state.exchange.fetch_time()
-        okx_status = "Online 🟢"
-    except Exception:
-        pass # يبقى الحالة Offline
-        
-    # فحص Redis
-    try:
-        await worker_state.redis_client.ping()
-        redis_status = "Listening 🟢"
-    except Exception:
-        pass # يبقى الحالة Offline
-
-    message = f"💓 **Heartbeat** | حالة البوت:\n- OKX: {okx_status}\n- Redis: {redis_status}"
-    await safe_send_message(context.bot, message)
-
+# --- 🤖 واجهة تليجرام 🤖 ---
 async def safe_send_message(bot, text, **kwargs):
-    # ... (الكود كما هو)
     try:
         await bot.send_message(TELEGRAM_CHAT_ID, text, parse_mode=ParseMode.MARKDOWN, **kwargs)
     except Exception as e:
         logging.error(f"Telegram Send Error: {e}")
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # ... (الكود كما هو)
     keyboard = [["Dashboard 🖥️"]]
     await update.message.reply_text("أهلاً بك في **بوت OKX المنفذ**.\nأنا استمع للإشارات من البوت الرئيسي وجاهز لتنفيذها على حسابك.",
                                     reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True),
                                     parse_mode=ParseMode.MARKDOWN)
 
 async def show_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # ... (الكود كما هو)
     keyboard = [
         [InlineKeyboardButton("💼 المحفظة", callback_data="show_portfolio")],
         [InlineKeyboardButton("📈 الصفقات النشطة", callback_data="show_active_trades")],
@@ -183,9 +165,8 @@ async def show_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("🕵️‍♂️ التشخيص", callback_data="show_diagnostics")],
     ]
     await update.message.reply_text("🖥️ **لوحة التحكم**", reply_markup=InlineKeyboardMarkup(keyboard))
-
+    
 async def show_portfolio(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # ... (الكود كما هو)
     query = update.callback_query
     await query.answer("جاري جلب بيانات المحفظة...")
     try:
@@ -205,73 +186,47 @@ async def show_portfolio(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def show_diagnostics(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer("جاري إجراء فحص حي...")
-    
-    # --- [تعديل] إجراء فحص حي ومباشر ---
-    okx_status = "Disconnected 🔴"
-    okx_time_str = "N/A"
+    # فحص اتصال OKX
     try:
-        server_time_ms = await worker_state.exchange.fetch_time()
-        okx_status = "Connected 🟢"
-        server_dt = datetime.fromtimestamp(server_time_ms / 1000, EGYPT_TZ)
-        okx_time_str = server_dt.strftime('%Y-%m-%d %H:%M:%S')
-    except Exception as e:
-        okx_status = f"Disconnected 🔴 ({type(e).__name__})"
+        await worker_state.exchange.fetch_time()
+        worker_state.connections["okx"] = "Connected 🟢"
+    except Exception:
+        worker_state.connections["okx"] = "Disconnected 🔴"
 
-    redis_status = "Disconnected 🔴"
-    try:
-        await worker_state.redis_client.ping()
-        redis_status = "Connected & Listening 🟢"
-    except Exception as e:
-        redis_status = f"Disconnected 🔴 ({type(e).__name__})"
-
-    report = (f"🕵️‍♂️ **تقرير التشخيص المباشر**\n\n"
+    report = (f"🕵️‍♂️ **تقرير التشخيص**\n\n"
               f"**حالة الاتصالات:**\n"
-              f"- اتصال بـ OKX: **{okx_status}**\n"
-              f"  - توقيت المنصة: `{okx_time_str}`\n"
-              f"- اتصال بـ Redis: **{redis_status}**\n\n"
+              f"- اتصال بـ OKX: **{worker_state.connections['okx']}**\n"
+              f"- اتصال بـ Redis: **{worker_state.connections['redis']}**\n\n"
               f"**إعدادات:**\n"
               f"- حجم الصفقة المحدد: `${TRADE_SIZE_USDT}`")
     await query.edit_message_text(report, parse_mode=ParseMode.MARKDOWN)
 
+# ... يمكنك إضافة دوال لعرض الصفقات النشطة والسجل بنفس طريقة البوت الرئيسي ...
+# ... بالاعتماد على الاستعلام من قاعدة البيانات المحلية (DB_FILE) ...
+
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # ... (الكود كما هو)
     if update.message.text == "Dashboard 🖥️":
         await show_dashboard(update, context)
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # ... (الكود كما هو)
     query = update.callback_query
     if query.data == "show_portfolio":
         await show_portfolio(update, context)
     elif query.data == "show_diagnostics":
         await show_diagnostics(update, context)
+    # ... أكمل بقية الأزرار ...
 
+# --- 🚀 نقطة الانطلاق 🚀 ---
 async def post_init(application: Application):
     worker_state.telegram_app = application
-    await safe_send_message(application.bot, "*🤖 بوت OKX المنفذ قيد التشغيل...*\n\nجاري فحص الاتصالات...")
-    
-    # فحص أولي للاتصالات
-    try:
-        worker_state.exchange = ccxt.okx({'apiKey': OKX_API_KEY, 'secret': OKX_API_SECRET, 'password': OKX_API_PASSPHONSE, 'enableRateLimit': True})
-        await worker_state.exchange.load_markets()
-        worker_state.connections["okx"] = "Connected 🟢"
-        await safe_send_message(application.bot, "✅ **اتصال OKX ناجح.**")
-    except Exception as e:
-        worker_state.connections["okx"] = f"Failed 🔴: {e}"
-        await safe_send_message(application.bot, f"❌ **فشل الاتصال بـ OKX:**\n`{e}`")
-
+    worker_state.exchange = ccxt.okx({'apiKey': OKX_API_KEY, 'secret': OKX_API_SECRET, 'password': OKX_API_PASSPHRASE, 'enableRateLimit': True})
     await init_database()
     asyncio.create_task(redis_listener())
-    
-    # --- [تعديل] جدولة مهمة نبض القلب الدورية ---
-    jq = application.job_queue
-    jq.run_repeating(heartbeat_check, interval=HEARTBEAT_INTERVAL_SECONDS, first=HEARTBEAT_INTERVAL_SECONDS)
-    
-    logging.info(f"Worker UI Bot is running. Heartbeat scheduled every {HEARTBEAT_INTERVAL_SECONDS} seconds.")
+    logging.info("Worker UI Bot is running...")
+    await safe_send_message(application.bot, "*🤖 بوت OKX المنفذ بدأ العمل...*")
 
 def main():
-    if not all([OKX_API_KEY, OKX_API_SECRET, OKX_API_PASSPHONSE, REDIS_URL, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID]):
+    if not all([OKX_API_KEY, OKX_API_SECRET, OKX_API_PASSPHRASE, REDIS_URL, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID]):
         print("FATAL: Please check your .env file. All variables are required.")
         return
         
