@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 # =======================================================================================
-# --- 🤖 OKX Worker Mirror Bot | v3.3 (النسخة النهائية والمستقرة) 🤖 ---
+# --- 🤖 OKX Worker Mirror Bot | v3.5 (الإصدار المستقر النهائي) 🤖 ---
 # =======================================================================================
-# v3.3 Changelog:
-#   ✅ [إصلاح جذري] تم إصلاح خطأ `AttributeError` المتعلق بـ `JobQueue`.
-#   ✅ [تحصين] إضافة تحقق للتأكد من وجود `JobQueue` قبل استخدامه لمنع الانهيار.
-#   ✅ [استقرار] هذا الإصدار جاهز للعمل بشكل مستقر على منصات مثل Render.
+# v3.5 Changelog:
+#   ✅ [إصلاح جذري ونهائي] تم إصلاح خطأ `TypeError: 'NoneType' object is not callable`
+#      عن طريق إعادة هيكلة دالة `main` واستدعاء `post_init` بالطريقة الصحيحة.
+#   ✅ [استقرار] هذا هو الإصدار النهائي المصمم للعمل بثبات على Render.
 # =======================================================================================
 
 import asyncio
@@ -21,7 +21,7 @@ from dotenv import load_dotenv
 
 from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters, CallbackQueryHandler
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters, CallbackQueryHandler, JobQueue
 from telegram.error import BadRequest, Conflict
 
 # --- ⚙️ الإعدادات والتهيئة ⚙️ ---
@@ -53,7 +53,6 @@ async def acquire_lock(redis_client, lock_key, expiry_seconds=30):
     return await redis_client.set(lock_key, "running", ex=expiry_seconds, nx=True)
 
 # --- باقي الدوال (init_database, execute_trade, etc.) ---
-# ... (هذه الدوال لم تتغير وموجودة بالكامل هنا)
 async def init_database():
     async with aiosqlite.connect(DB_FILE) as conn:
         await conn.execute('''
@@ -73,7 +72,6 @@ async def execute_trade(signal):
         async with aiosqlite.connect(DB_FILE) as conn:
             cursor = await conn.execute("SELECT id FROM trades WHERE symbol = ? AND status = 'active'", (symbol,))
             if await cursor.fetchone():
-                logger.warning(f"Signal for {symbol} ignored. Active trade already exists.")
                 await safe_send_message(f"⚠️ تم تجاهل إشارة لـ `{symbol}` لوجود صفقة نشطة بالفعل.")
                 return
 
@@ -140,6 +138,7 @@ async def redis_listener():
 
 # --- واجهة تليجرام ---
 async def safe_send_message(text, **kwargs):
+    if not worker_state.telegram_app: return
     try:
         await worker_state.telegram_app.bot.send_message(TELEGRAM_CHAT_ID, text, parse_mode=ParseMode.MARKDOWN, **kwargs)
     except BadRequest as e:
@@ -344,7 +343,9 @@ async def show_diagnostics(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     redis_status = "Disconnected 🔴"
     try:
-        redis_client = redis.from_url(REDIS_URL); await redis_client.ping(); redis_status = "Connected & Listening 🟢"; await redis_client.close()
+        async with redis.from_url(REDIS_URL) as temp_redis:
+            await temp_redis.ping()
+            redis_status = "Connected & Listening 🟢"
     except Exception: pass
     
     report = (f"🕵️‍♂️ **تقرير التشخيص المباشر**\n\n"
@@ -391,6 +392,7 @@ async def post_init(application: Application):
     asyncio.create_task(redis_listener())
     logger.info("Worker Mirror Bot is running.")
 
+
 async def main():
     if not all([OKX_API_KEY, OKX_API_SECRET, OKX_API_PASSPHRASE, REDIS_URL, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID]):
         logger.critical("FATAL: Please check your .env file.")
@@ -401,7 +403,7 @@ async def main():
     
     if not await acquire_lock(redis_client, lock_key):
         logger.warning(f"Another instance is already running (lock '{lock_key}' is held). This instance will not start.")
-        await redis_client.close()
+        await redis_client.aclose()
         return
 
     logger.info(f"Successfully acquired lock '{lock_key}'. This instance is now the primary.")
@@ -412,33 +414,29 @@ async def main():
         except Exception as e:
             logger.error(f"Could not refresh lock: {e}")
 
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    # --- الإصلاح النهائي لطريقة بناء التطبيق ---
+    builder = Application.builder().token(TELEGRAM_BOT_TOKEN)
     
-    if not app.job_queue:
-        logger.critical("JobQueue is not available. Please install dependency: pip install \"python-telegram-bot[job-queue]\"")
-        await redis_client.delete(lock_key)
-        await redis_client.close()
-        return
+    # يجب أن يكون لدى Render القدرة على تثبيت هذه الإضافة عبر requirements.txt
+    # سنضيف تحصيناً للتحقق من وجودها
+    if builder.job_queue:
+        builder.job_queue.run_repeating(refresh_lock, interval=15)
+    else:
+        logger.warning("JobQueue not found. Lock will not be refreshed. This is OK for short-lived instances but not for long-running bots.")
 
-    app.job_queue.run_repeating(refresh_lock, interval=15)
+    app = builder.build()
     
     # ربط المعالجات
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
     app.add_handler(CallbackQueryHandler(button_handler))
     
-    # الربط بعد إنشاء التطبيق
-    await app.post_init(app)
+    # تمرير التطبيق إلى دالة post_init
+    await post_init(app)
 
     try:
         logger.info("Starting Telegram polling...")
-        await app.initialize()
-        await app.start()
-        await app.updater.start_polling()
-        
-        # حلقة لا نهائية لإبقاء البرنامج يعمل
-        while True:
-            await asyncio.sleep(3600)
+        await app.run_polling()
 
     except Conflict:
         logger.critical("TELEGRAM CONFLICT: Another instance of the bot is running. Shutting down.")
@@ -447,7 +445,7 @@ async def main():
     finally:
         logger.info("Releasing lock before shutting down...")
         await redis_client.delete(lock_key)
-        await redis_client.close()
+        await redis_client.aclose()
         logger.info("Lock released. Shutdown complete.")
 
 if __name__ == '__main__':
