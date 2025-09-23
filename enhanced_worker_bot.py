@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 # =======================================================================================
-# --- 🤖 OKX Worker Mirror Bot | v3.5 (الإصدار المستقر النهائي) 🤖 ---
+# --- 🤖 OKX Worker Mirror Bot | v4.0 (الإصدار المستقر النهائي) 🤖 ---
 # =======================================================================================
-# v3.5 Changelog:
-#   ✅ [إصلاح جذري ونهائي] تم إصلاح خطأ `TypeError: 'NoneType' object is not callable`
-#      عن طريق إعادة هيكلة دالة `main` واستدعاء `post_init` بالطريقة الصحيحة.
+# v4.0 Changelog:
+#   ✅ [إصلاح جذري ونهائي] تم إصلاح خطأ `AttributeError: 'function' object has no attribute 'run_repeating'`
+#      عن طريق إعادة هيكلة دالة `main` بالكامل لضمان بناء التطبيق قبل جدولة المهام.
 #   ✅ [استقرار] هذا هو الإصدار النهائي المصمم للعمل بثبات على Render.
 # =======================================================================================
 
@@ -21,7 +21,7 @@ from dotenv import load_dotenv
 
 from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters, CallbackQueryHandler, JobQueue
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters, CallbackQueryHandler
 from telegram.error import BadRequest, Conflict
 
 # --- ⚙️ الإعدادات والتهيئة ⚙️ ---
@@ -32,7 +32,7 @@ OKX_API_PASSPHRASE = os.getenv('OKX_API_PASSPHRASE')
 REDIS_URL = os.getenv('REDIS_URL')
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
-DB_FILE = 'my_trades_v3.db'
+DB_FILE = 'my_trades_v4.db' # اسم جديد لقاعدة البيانات لتجنب أي تعارض
 TRADE_SIZE_USDT = float(os.getenv('TRADE_SIZE_USDT', '15.0'))
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -393,6 +393,7 @@ async def post_init(application: Application):
     logger.info("Worker Mirror Bot is running.")
 
 
+# --- [الإصلاح النهائي] ---
 async def main():
     if not all([OKX_API_KEY, OKX_API_SECRET, OKX_API_PASSPHRASE, REDIS_URL, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID]):
         logger.critical("FATAL: Please check your .env file.")
@@ -402,7 +403,7 @@ async def main():
     redis_client = redis.from_url(REDIS_URL)
     
     if not await acquire_lock(redis_client, lock_key):
-        logger.warning(f"Another instance is already running (lock '{lock_key}' is held). This instance will not start.")
+        logger.warning(f"Another instance is already running. This new instance will shut down.")
         await redis_client.aclose()
         return
 
@@ -414,25 +415,20 @@ async def main():
         except Exception as e:
             logger.error(f"Could not refresh lock: {e}")
 
-    # --- الإصلاح النهائي لطريقة بناء التطبيق ---
-    builder = Application.builder().token(TELEGRAM_BOT_TOKEN)
-    
-    # يجب أن يكون لدى Render القدرة على تثبيت هذه الإضافة عبر requirements.txt
-    # سنضيف تحصيناً للتحقق من وجودها
-    if builder.job_queue:
-        builder.job_queue.run_repeating(refresh_lock, interval=15)
-    else:
-        logger.warning("JobQueue not found. Lock will not be refreshed. This is OK for short-lived instances but not for long-running bots.")
-
+    # 1. بناء التطبيق وتمرير post_init
+    builder = Application.builder().token(TELEGRAM_BOT_TOKEN).post_init(post_init)
     app = builder.build()
+
+    # 2. الوصول إلى JobQueue من التطبيق المبني وتشغيل المهمة
+    if app.job_queue:
+        app.job_queue.run_repeating(refresh_lock, interval=15)
+    else:
+        logger.warning("JobQueue not found. Lock will not be refreshed.")
     
-    # ربط المعالجات
+    # 3. ربط المعالجات
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
     app.add_handler(CallbackQueryHandler(button_handler))
-    
-    # تمرير التطبيق إلى دالة post_init
-    await post_init(app)
 
     try:
         logger.info("Starting Telegram polling...")
@@ -446,7 +442,9 @@ async def main():
         logger.info("Releasing lock before shutting down...")
         await redis_client.delete(lock_key)
         await redis_client.aclose()
-        logger.info("Lock released. Shutdown complete.")
+        if worker_state.exchange:
+            await worker_state.exchange.close()
+        logger.info("Lock released and resources closed. Shutdown complete.")
 
 if __name__ == '__main__':
     asyncio.run(main())
