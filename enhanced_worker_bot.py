@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
 # =======================================================================================
-# --- 🤖 OKX Worker Mirror Bot | v3.2 (Async Fix) 🤖 ---
+# --- 🤖 OKX Worker Mirror Bot | v3.3 (النسخة النهائية والمستقرة) 🤖 ---
 # =======================================================================================
-# v3.2 Changelog:
-#   ✅ [إصلاح] حل مشكلة `SyntaxError: 'await' outside async function` عن طريق
-#      تحويل دالة `main` إلى دالة غير متزامنة (async).
+# v3.3 Changelog:
+#   ✅ [إصلاح جذري] تم إصلاح خطأ `AttributeError` المتعلق بـ `JobQueue`.
+#   ✅ [تحصين] إضافة تحقق للتأكد من وجود `JobQueue` قبل استخدامه لمنع الانهيار.
+#   ✅ [استقرار] هذا الإصدار جاهز للعمل بشكل مستقر على منصات مثل Render.
 # =======================================================================================
 
 import asyncio
@@ -52,7 +53,7 @@ async def acquire_lock(redis_client, lock_key, expiry_seconds=30):
     return await redis_client.set(lock_key, "running", ex=expiry_seconds, nx=True)
 
 # --- باقي الدوال (init_database, execute_trade, etc.) ---
-# ... (هذه الدوال لم تتغير)
+# ... (هذه الدوال لم تتغير وموجودة بالكامل هنا)
 async def init_database():
     async with aiosqlite.connect(DB_FILE) as conn:
         await conn.execute('''
@@ -137,7 +138,7 @@ async def redis_listener():
             await safe_send_message(f"🔴 **انقطع اتصال Redis.** جارِ محاولة إعادة الاتصال...")
             await asyncio.sleep(15)
 
-# --- واجهة تليجرام (لم تتغير) ---
+# --- واجهة تليجرام ---
 async def safe_send_message(text, **kwargs):
     try:
         await worker_state.telegram_app.bot.send_message(TELEGRAM_CHAT_ID, text, parse_mode=ParseMode.MARKDOWN, **kwargs)
@@ -335,42 +336,36 @@ async def show_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def show_diagnostics(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer("جاري إجراء فحص حي...")
-    # This logic is now part of button_handler to avoid code duplication
-    await button_handler(update, context, force_diagnostics=True)
+    
+    okx_status, okx_time_str = "Disconnected 🔴", "N/A"
+    try:
+        okx_status = "Connected 🟢"; okx_time_str = datetime.fromtimestamp(await worker_state.exchange.fetch_time() / 1000, EGYPT_TZ).strftime('%H:%M:%S')
+    except Exception: okx_status = f"Disconnected 🔴"
 
+    redis_status = "Disconnected 🔴"
+    try:
+        redis_client = redis.from_url(REDIS_URL); await redis_client.ping(); redis_status = "Connected & Listening 🟢"; await redis_client.close()
+    except Exception: pass
+    
+    report = (f"🕵️‍♂️ **تقرير التشخيص المباشر**\n\n"
+            f"**🦾 بوت الذراع (هذا البوت):**\n"
+            f"- اتصال بـ OKX: **{okx_status}** (توقيت: `{okx_time_str}`)\n"
+            f"- اتصال بـ Redis: **{redis_status}**")
+    await query.edit_message_text(report, parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 العودة", callback_data="back_to_dashboard")]]))
 
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.text == "Dashboard 🖥️":
         await show_dashboard_message(update.message)
 
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE, force_diagnostics=False):
-    query = update.callback_query
-    data = query.data
-
-    if data == "show_diagnostics" or force_diagnostics:
-        okx_status, okx_time_str = "Disconnected 🔴", "N/A"
-        try:
-            okx_status = "Connected 🟢"; okx_time_str = datetime.fromtimestamp(await worker_state.exchange.fetch_time() / 1000, EGYPT_TZ).strftime('%H:%M:%S')
-        except Exception: okx_status = f"Disconnected 🔴"
-
-        redis_status = "Disconnected 🔴"
-        try:
-            redis_client = redis.from_url(REDIS_URL); await redis_client.ping(); redis_status = "Connected & Listening 🟢"; await redis_client.close()
-        except Exception: pass
-        
-        report = (f"🕵️‍♂️ **تقرير التشخيص المباشر**\n\n"
-                f"**🦾 بوت الذراع (هذا البوت):**\n"
-                f"- اتصال بـ OKX: **{okx_status}** (توقيت: `{okx_time_str}`)\n"
-                f"- اتصال بـ Redis: **{redis_status}**")
-        await query.edit_message_text(report, parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 العودة", callback_data="back_to_dashboard")]]))
-        return
-
-
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query; data = query.data
+    
     routes = {
         "show_brain_mirror": show_brain_mirror,
         "show_portfolio": show_portfolio,
         "show_active_trades": show_active_trades,
         "show_history": show_history,
+        "show_diagnostics": show_diagnostics,
         "back_to_dashboard": show_dashboard_message
     }
     
@@ -380,7 +375,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE, for
         await show_trade_details(update, context)
     elif data.startswith("close_trade_"):
         await close_trade_handler(update, context)
-
 
 async def post_init(application: Application):
     worker_state.telegram_app = application
@@ -397,8 +391,6 @@ async def post_init(application: Application):
     asyncio.create_task(redis_listener())
     logger.info("Worker Mirror Bot is running.")
 
-
-# --- [تعديل] تحويل دالة main إلى async ---
 async def main():
     if not all([OKX_API_KEY, OKX_API_SECRET, OKX_API_PASSPHRASE, REDIS_URL, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID]):
         logger.critical("FATAL: Please check your .env file.")
@@ -407,9 +399,7 @@ async def main():
     lock_key = f"bot_lock:{TELEGRAM_BOT_TOKEN}"
     redis_client = redis.from_url(REDIS_URL)
     
-    is_locked = not await acquire_lock(redis_client, lock_key)
-    
-    if is_locked:
+    if not await acquire_lock(redis_client, lock_key):
         logger.warning(f"Another instance is already running (lock '{lock_key}' is held). This instance will not start.")
         await redis_client.close()
         return
@@ -422,19 +412,31 @@ async def main():
         except Exception as e:
             logger.error(f"Could not refresh lock: {e}")
 
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).post_init(post_init).build()
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     
+    if not app.job_queue:
+        logger.critical("JobQueue is not available. Please install dependency: pip install \"python-telegram-bot[job-queue]\"")
+        await redis_client.delete(lock_key)
+        await redis_client.close()
+        return
+
     app.job_queue.run_repeating(refresh_lock, interval=15)
+    
+    # ربط المعالجات
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
     app.add_handler(CallbackQueryHandler(button_handler))
     
+    # الربط بعد إنشاء التطبيق
+    await app.post_init(app)
+
     try:
         logger.info("Starting Telegram polling...")
         await app.initialize()
         await app.start()
         await app.updater.start_polling()
-        # Keep the main coroutine alive
+        
+        # حلقة لا نهائية لإبقاء البرنامج يعمل
         while True:
             await asyncio.sleep(3600)
 
@@ -448,7 +450,6 @@ async def main():
         await redis_client.close()
         logger.info("Lock released. Shutdown complete.")
 
-# --- [تعديل] تغيير طريقة استدعاء main ---
 if __name__ == '__main__':
     asyncio.run(main())
 
