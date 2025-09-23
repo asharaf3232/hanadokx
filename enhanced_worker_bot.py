@@ -23,7 +23,7 @@ from dotenv import load_dotenv
 from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters, CallbackQueryHandler
-from telegram.error import BadRequest
+from telegram.error import BadRequest, Conflict
 
 # --- ⚙️ الإعدادات والتهيئة ⚙️ ---
 load_dotenv()
@@ -382,7 +382,15 @@ def main():
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
     app.add_handler(CallbackQueryHandler(button_handler))
-    app.run_polling()
+    
+    try:
+        logger.info("Starting Telegram polling...")
+        app.run_polling()
+    except Conflict:
+        logger.critical("TELEGRAM CONFLICT: Another instance of the bot is running. Shutting down.")
+    except Exception as e:
+        logger.critical(f"An unexpected error occurred in the main loop: {e}", exc_info=True)
+
 
 if __name__ == '__main__':
     main()
