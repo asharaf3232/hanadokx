@@ -26,7 +26,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandl
 from telegram.error import BadRequest, Conflict
 
 # --- ⚙️ الإعدادات والتهيئة ⚙️ ---
-load_dotenv()
+# ... (نفس الإعدادات)
 OKX_API_KEY = os.getenv('OKX_API_KEY')
 OKX_API_SECRET = os.getenv('OKX_API_SECRET')
 OKX_API_PASSPHRASE = os.getenv('OKX_API_PASSPHRASE')
@@ -49,7 +49,16 @@ class WorkerState:
 
 worker_state = WorkerState()
 
-# --- 🗃️ إدارة قاعدة البيانات المحلية 🗃️ ---
+# --- [إضافة جديدة] دالة قفل التفرد ---
+async def acquire_lock(redis_client, lock_key, expiry_seconds=30):
+    """
+    Tries to acquire a lock in Redis. Returns True if successful, False otherwise.
+    This prevents multiple instances from running.
+    """
+    # The 'nx=True' argument means "set only if the key does not already exist".
+    return await redis_client.set(lock_key, "running", ex=expiry_seconds, nx=True)
+
+# ... (بقية الدوال كما هي: init_database, execute_trade, redis_listener, etc.)
 async def init_database():
     async with aiosqlite.connect(DB_FILE) as conn:
         await conn.execute('''
@@ -377,8 +386,32 @@ def main():
     if not all([OKX_API_KEY, OKX_API_SECRET, OKX_API_PASSPHRASE, REDIS_URL, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID]):
         logger.critical("FATAL: Please check your .env file.")
         return
-        
+    
+    # --- [تعديل] إضافة منطق قفل التفرد قبل بدء البوت ---
+    lock_key = f"bot_lock:{TELEGRAM_BOT_TOKEN}"
+    redis_client = redis.from_url(REDIS_URL)
+    
+    is_locked = not await acquire_lock(redis_client, lock_key)
+    
+    if is_locked:
+        logger.warning(f"Another instance is already running (lock '{lock_key}' is held). This instance will not start.")
+        await redis_client.close()
+        return # إيقاف تشغيل هذه النسخة الجديدة
+
+    logger.info(f"Successfully acquired lock '{lock_key}'. This instance is now the primary.")
+    
+    # دالة لتحديث القفل بشكل دوري
+    async def refresh_lock(context: ContextTypes.DEFAULT_TYPE):
+        try:
+            await redis_client.expire(lock_key, 30)
+        except Exception as e:
+            logger.error(f"Could not refresh lock: {e}")
+
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).post_init(post_init).build()
+    
+    # جدولة مهمة تحديث القفل كل 15 ثانية
+    app.job_queue.run_repeating(refresh_lock, interval=15)
+
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
     app.add_handler(CallbackQueryHandler(button_handler))
@@ -390,6 +423,12 @@ def main():
         logger.critical("TELEGRAM CONFLICT: Another instance of the bot is running. Shutting down.")
     except Exception as e:
         logger.critical(f"An unexpected error occurred in the main loop: {e}", exc_info=True)
+    finally:
+        # --- [إضافة جديدة] تحرير القفل عند الإغلاق ---
+        logger.info("Releasing lock before shutting down...")
+        await redis_client.delete(lock_key)
+        await redis_client.close()
+        logger.info("Lock released. Shutdown complete.")
 
 
 if __name__ == '__main__':
